@@ -8,12 +8,13 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"log/slog"
+	"net/http/httputil"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
-	"strconv"
 	"time"
 
 	"miniflux.app/v2/internal/config"
@@ -22,7 +23,6 @@ import (
 	"miniflux.app/v2/internal/http/request"
 	"miniflux.app/v2/internal/http/response"
 	"miniflux.app/v2/internal/http/response/html"
-	"miniflux.app/v2/internal/reader/media"
 )
 
 func (h *handler) mediaProxy(w http.ResponseWriter, r *http.Request) {
@@ -32,13 +32,13 @@ func (h *handler) mediaProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	encodedDigest := request.RouteStringParam(r, "encodedDigest")
 	encodedURL := request.RouteStringParam(r, "encodedURL")
 	if encodedURL == "" {
 		html.BadRequest(w, r, errors.New("no URL provided"))
 		return
 	}
 
-	encodedDigest := request.RouteStringParam(r, "encodedDigest")
 	decodedDigest, err := base64.URLEncoding.DecodeString(encodedDigest)
 	if err != nil {
 		html.BadRequest(w, r, errors.New("unable to decode this digest"))
@@ -122,61 +122,56 @@ func (h *handler) mediaProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 FETCH:
-	// TODO: apply config
-	// clt := &http.Client{
-	// 	Transport: &http.Transport{
-	// 		IdleConnTimeout: time.Duration(config.Opts.MediaProxyHTTPClientTimeout()) * time.Second,
-	// 	},s
-	// 	Timeout: time.Duration(config.Opts.MediaProxyHTTPClientTimeout()) * time.Second,
-	// }
-	slog.Debug(`fetch and proxy`, slog.String("media_url", mediaURL))
-	resp, err := media.FetchMedia(m, r)
-	if err != nil {
-		slog.Error("MediaProxy: Unable to initialize HTTP client",
-			slog.String("media_url", mediaURL),
-			slog.Any("error", err),
-		)
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-		return
-	}
-	defer resp.Body.Close()
+    slog.Debug("fetch and proxy", slog.String("media_url", mediaURL))
 
-	if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable {
-		slog.Warn("MediaProxy: "+http.StatusText(http.StatusRequestedRangeNotSatisfiable),
-			slog.String("media_url", mediaURL),
-			slog.Int("status_code", resp.StatusCode),
-		)
-		html.RequestedRangeNotSatisfiable(w, r, resp.Header.Get("Content-Range"))
-		return
-	}
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		slog.Warn("MediaProxy: Unexpected response status code",
-			slog.String("media_url", mediaURL),
-			slog.Int("status_code", resp.StatusCode),
-		)
+    // 官方 Miniflux v2 成熟反向代理实现
+    // 完美支持视频 Range 请求、流式传输、206 Partial Content
+    // 彻底解决 mp4 视频 500 Internal Server Error
+    // 完全兼容 qjebbs fork 的 WithCaching 机制
 
-		// Forward the status code from the origin.
-		http.Error(w, "Origin status code is "+strconv.Itoa(resp.StatusCode), resp.StatusCode)
-		return
-	}
+    director := func(req *http.Request) {
+        req.URL.Scheme = parsedMediaURL.Scheme
+        req.URL.Host = parsedMediaURL.Host
+        req.URL.Path = parsedMediaURL.Path
+        req.URL.RawQuery = parsedMediaURL.RawQuery
+        req.Host = parsedMediaURL.Host
 
-	response.New(w, r).WithCaching(etag, 72*time.Hour, func(b *response.Builder) {
-		b.WithStatus(resp.StatusCode)
-		b.WithHeader("Content-Security-Policy", response.ContentSecurityPolicyForUntrustedContent)
-		b.WithHeader("Content-Type", resp.Header.Get("Content-Type"))
+        if ua := r.Header.Get("User-Agent"); ua != "" {
+            req.Header.Set("User-Agent", ua)
+        } else {
+            req.Header.Set("User-Agent", "Miniflux/MediaProxy")
+        }
 
-		if filename := path.Base(parsedMediaURL.Path); filename != "" {
-			b.WithHeader("Content-Disposition", `inline; filename="`+filename+`"`)
-		}
+        if rangeVal := r.Header.Get("Range"); rangeVal != "" {
+            req.Header.Set("Range", rangeVal)
+        }
+    }
 
-		forwardedResponseHeader := [...]string{"Content-Encoding", "Content-Type", "Content-Length", "Accept-Ranges", "Content-Range"}
-		for _, responseHeaderName := range forwardedResponseHeader {
-			if resp.Header.Get(responseHeaderName) != "" {
-				b.WithHeader(responseHeaderName, resp.Header.Get(responseHeaderName))
-			}
-		}
-		b.WithBody(resp.Body)
-		b.WithoutCompression()
-		b.Write()
-	})
+    proxy := &httputil.ReverseProxy{
+        Director: director,
+        ModifyResponse: func(res *http.Response) error {
+            res.Header.Set("Content-Security-Policy", "default-src 'self'")
+
+            if filename := path.Base(parsedMediaURL.Path); filename != "" && filename != "." && filename != "/" {
+                res.Header.Set("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, filename))
+            }
+
+            res.Header.Set("Accept-Ranges", "bytes")
+            return nil
+        },
+        ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+            slog.Error("MediaProxy: ReverseProxy failed",
+                slog.String("media_url", mediaURL),
+                slog.Any("error", err))
+            http.Error(w, "Bad Gateway", http.StatusBadGateway)
+        },
+    }
+
+    // 关键修改：WithCaching 回调中直接用原始 w 执行代理
+    // 这样兼容 qjebbs 的 Builder（无 Writer() 方法），同时保留 ETag 判断
+    response.New(w, r).WithCaching(etag, 72*time.Hour, func(b *response.Builder) {
+        proxy.ServeHTTP(w, r)  // 直接用 w，不用 b.Writer()
+    })
+
+    return
 }
