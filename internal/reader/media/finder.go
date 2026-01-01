@@ -68,6 +68,9 @@ func FetchMedia(media *model.Media, r *http.Request) (*http.Response, error) {
 	requestBuilder.WithCustomApplicationProxyURL(config.Opts.HTTPClientProxyURL())
 	requestBuilder.WithUserAgent("", config.Opts.HTTPClientUserAgent())
 	
+	// === 关键修复：强制加上 Connection: close，解决自动缓存图片损坏问题 ===
+    requestBuilder.WithHeader("Connection", "close")
+	
 	// req.Header.Add("Connection", "close")
 	
 	if media.Referrer != "" {
