@@ -9,7 +9,7 @@ require (
 	github.com/go-webauthn/webauthn v0.15.0
 	github.com/gorilla/mux v1.8.1
 	github.com/h2non/filetype v1.1.3
-	github.com/lib/pq v1.10.9
+	github.com/lib/pq v1.11.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/tdewolff/minify/v2 v2.24.8
 	golang.org/x/crypto v0.46.0
